@@ -53,8 +53,8 @@ def main(args):
     print("Initializing calibration models...")
     standard_calibration = StandardTemperatureScaling(init_temp=1.5)
     
-    # For class-adaptive, initialize temperatures closer to 1
-    adaptive_calibration = ClassAdaptiveCalibration(num_classes=100, init_temp=1.0)
+    # For class-adaptive, initialize temperatures with more variation
+    adaptive_calibration = ClassAdaptiveCalibration(num_classes=100, init_temp=1.5)
     
     # Train standard calibration first
     print("\nTraining standard temperature scaling...")
@@ -73,7 +73,7 @@ def main(args):
     # Save model
     torch.save(standard_calibration.state_dict(), os.path.join('models', 'standard_calibration.pth'))
     
-    # Train adaptive calibration with stronger regularization
+    # Train adaptive calibration with appropriate regularization
     print("\nTraining class-adaptive calibration...")
     adaptive_calibration = train_calibration(
         base_model, 
@@ -82,7 +82,7 @@ def main(args):
         val_loader, 
         lr=args.learning_rate,
         epochs=args.epochs * 2,  # Double the epochs for class-adaptive
-        l2_reg_strength=args.l2_reg * 5,  # Stronger regularization
+        l2_reg_strength=args.l2_reg * 0.2,  # Use less regularization to allow more flexibility
         device=device,
         patience=args.patience * 2
     )
@@ -143,7 +143,7 @@ def main(args):
     # Temperature distribution
     plot_temperature_distribution(
         adaptive_calibration,
-        class_names=class_names,
+        class_names=None,  # Too many classes for clear visualization
         save_path=os.path.join('results', f'temperature_distribution_{timestamp}.png')
     )
     

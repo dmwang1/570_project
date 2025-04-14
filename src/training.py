@@ -2,211 +2,226 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import time
+from tqdm import tqdm
+
 from .metrics import expected_calibration_error, class_adaptive_calibration_error
 
-def train_calibration(base_model, calibration_model, train_loader, val_loader, lr=0.01, epochs=50, 
-                     l2_reg_strength=0.01, device=None, patience=5):
+def train_calibration(base_model, calibration_model, train_loader, val_loader, 
+                      lr=0.01, epochs=50, l2_reg_strength=0.01, device='cuda', patience=5):
     """
-    Train the calibration model with early stopping
+    Train a calibration model using NLL loss with L2 regularization.
     
     Args:
-        base_model: The pre-trained classification model
-        calibration_model: The calibration model to train
+        base_model: Pre-trained classification model
+        calibration_model: Calibration model to train
         train_loader: DataLoader for training data
         val_loader: DataLoader for validation data
         lr: Learning rate
-        epochs: Maximum number of epochs
+        epochs: Number of training epochs
         l2_reg_strength: L2 regularization strength
         device: Device to use for training
-        patience: Number of epochs to wait for improvement before early stopping
+        patience: Early stopping patience
+        
+    Returns:
+        Trained calibration model
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_model.eval()  # Set base model to evaluation mode
+    calibration_model.to(device)
     
-    # Move models to device
-    base_model = base_model.to(device)
-    calibration_model = calibration_model.to(device)
-    
-    # Freeze base model weights
-    for param in base_model.parameters():
-        param.requires_grad = False
-    
-    # Use NLL loss for calibration
+    # Set up loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     
-    # Adjust learning rate and regularization based on model type
-    if isinstance(calibration_model, nn.Module) and hasattr(calibration_model, 'temperatures'):
-        # For class-adaptive model, use stronger regularization and lower learning rate
-        l2_reg_strength = max(l2_reg_strength * 5, 0.05)  # Increase regularization for class-adaptive
-        optimizer = optim.Adam(calibration_model.parameters(), lr=lr/2)  # Lower learning rate
+    # For class-adaptive, use different learning rate and regularization
+    if hasattr(calibration_model, 'temperatures') and calibration_model.temperatures.size(0) > 1:
         print(f"Class-Adaptive model: using L2 reg={l2_reg_strength}, lr={lr/2}")
+        optimizer = optim.Adam(calibration_model.parameters(), lr=lr/2)
     else:
-        optimizer = optim.Adam(calibration_model.parameters(), lr=lr)
         print(f"Standard model: using L2 reg={l2_reg_strength}, lr={lr}")
+        optimizer = optim.Adam(calibration_model.parameters(), lr=lr)
     
-    # Keep track of best model
-    best_ace = float('inf')
+    # Variables for early stopping
     best_ece = float('inf')
+    best_ace = float('inf')
     best_model_state = None
-    no_improve_count = 0
+    patience_counter = 0
     
-    # Training loop
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
+        # Training phase
         calibration_model.train()
         running_loss = 0.0
         
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             
-            # Get logits from base model
+            # Get logits from base model (without gradients)
             with torch.no_grad():
                 logits = base_model(inputs)
             
             # Apply calibration
             calibrated_logits = calibration_model(logits)
             
-            # Calculate loss
-            loss = criterion(calibrated_logits, labels)
+            # Calculate NLL loss
+            nll_loss = criterion(calibrated_logits, targets)
             
-            # Apply L2 regularization on temperature parameters
-            if hasattr(calibration_model, 'temperatures'):
-                # Use stronger regularization for class-adaptive
-                # Encourage temperatures to stay close to 1 (well-calibrated)
-                temps = calibration_model.temperatures
-                l2_reg = l2_reg_strength * torch.sum((temps - 1.0)**2)
-                loss += l2_reg
-            elif hasattr(calibration_model, 'temperature'):
-                l2_reg = l2_reg_strength * torch.sum((calibration_model.temperature - 1.0)**2)
-                loss += l2_reg
+            # Add L2 regularization
+            if hasattr(calibration_model, 'temperature'):
+                # Standard temperature scaling - regularize single parameter
+                l2_reg = l2_reg_strength * (calibration_model.temperature - 1.0) ** 2
+            else:
+                # Class-adaptive temperature scaling - regularize all parameters
+                # Encourage temperatures to be close to 1 to prevent overfitting
+                l2_reg = l2_reg_strength * torch.mean((calibration_model.temperatures - 1.0) ** 2)
             
-            # Update parameters
+            # Total loss
+            loss = nll_loss + l2_reg
+            
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
-            
-            # Gradient clipping to prevent extreme values
-            torch.nn.utils.clip_grad_norm_(calibration_model.parameters(), max_norm=1.0)
-            
             optimizer.step()
-            
-            # Add temperature constraints - prevent temperatures from getting too extreme
-            if hasattr(calibration_model, 'temperatures'):
-                with torch.no_grad():
-                    calibration_model.temperatures.data.clamp_(min=0.5, max=3.0)
-            elif hasattr(calibration_model, 'temperature'):
-                with torch.no_grad():
-                    calibration_model.temperature.data.clamp_(min=0.5, max=3.0)
             
             running_loss += loss.item()
         
+        # Calculate average loss for the epoch
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.4f}")
         
-        # Validation after each epoch
-        ece, ace = evaluate_calibration(base_model, calibration_model, val_loader, device)
-        print(f"Validation - ECE: {ece:.4f}, ACE: {ace:.4f}")
+        # Validation phase
+        calibration_model.eval()
+        val_ece, val_ace = evaluate_calibration(base_model, calibration_model, val_loader, device)
+        print(f"Validation - ECE: {val_ece:.4f}, ACE: {val_ace:.4f}")
         
-        # Save best model based on ECE as primary metric
-        if ece < best_ece:
-            best_ece = ece
-            best_ace = ace
+        # Check if this is the best model so far
+        if val_ece < best_ece:
+            best_ece = val_ece
+            best_ace = val_ace
             best_model_state = calibration_model.state_dict().copy()
-            no_improve_count = 0
-            print(f"New best model! ECE: {ece:.4f}, ACE: {ace:.4f}")
+            print(f"New best model! ECE: {best_ece:.4f}, ACE: {best_ace:.4f}")
+            patience_counter = 0
         else:
-            no_improve_count += 1
-        
+            patience_counter += 1
+            
         # Early stopping
-        if no_improve_count >= patience:
-            print(f"Early stopping at epoch {epoch+1}")
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}")
             break
     
-    # Print temperature statistics if available
-    if hasattr(calibration_model, 'temperatures'):
-        temps = calibration_model.temperatures.detach().cpu().numpy()
-        print(f"Temperature stats - Min: {temps.min():.4f}, Max: {temps.max():.4f}, Mean: {temps.mean():.4f}")
-    
-    # Load best model
+    # Load the best model state
     if best_model_state is not None:
         calibration_model.load_state_dict(best_model_state)
         print(f"Loaded best model with ECE: {best_ece:.4f}, ACE: {best_ace:.4f}")
     
+    # For class-adaptive, print temperature statistics
+    if hasattr(calibration_model, 'temperatures') and calibration_model.temperatures.size(0) > 1:
+        temps = calibration_model.get_temperatures()
+        print(f"Temperature stats - Min: {np.min(temps):.4f}, Max: {np.max(temps):.4f}, Mean: {np.mean(temps):.4f}")
+    
     return calibration_model
 
+
 def evaluate_calibration(base_model, calibration_model, data_loader, device):
-    """Evaluate calibration performance"""
+    """
+    Evaluate calibration metrics (ECE and ACE).
+    
+    Args:
+        base_model: Base classification model
+        calibration_model: Calibration model
+        data_loader: DataLoader for evaluation
+        device: Device to use for evaluation
+        
+    Returns:
+        Tuple of (ECE, ACE) metrics
+    """
     base_model.eval()
     calibration_model.eval()
     
     all_confidences = []
     all_predictions = []
-    all_labels = []
-    all_classes = []
+    all_targets = []
     
     with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, targets in data_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             
             # Get logits from base model
             logits = base_model(inputs)
             
             # Apply calibration
             calibrated_logits = calibration_model(logits)
-            probas = torch.softmax(calibrated_logits, dim=1)
             
-            # Get confidence and predictions
-            confidences, predictions = torch.max(probas, dim=1)
+            # Get softmax probabilities
+            probs = torch.softmax(calibrated_logits, dim=1)
             
-            all_confidences.extend(confidences.cpu().numpy())
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_classes.extend(labels.cpu().numpy())  # For ACE
+            # Get predictions and confidences
+            confidences, predictions = torch.max(probs, dim=1)
+            
+            # Store results
+            all_confidences.append(confidences.cpu().numpy())
+            all_predictions.append(predictions.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
     
-    # Calculate metrics
-    all_confidences = np.array(all_confidences)
-    all_predictions = np.array(all_predictions)
-    all_labels = np.array(all_labels)
-    all_classes = np.array(all_classes)
+    # Concatenate results
+    confidences = np.concatenate(all_confidences)
+    predictions = np.concatenate(all_predictions)
+    targets = np.concatenate(all_targets)
     
-    ece = expected_calibration_error(all_confidences, all_predictions, all_labels)
-    ace = class_adaptive_calibration_error(all_confidences, all_predictions, all_labels, all_classes)
+    # Calculate ECE and ACE
+    ece = expected_calibration_error(confidences, predictions, targets)
+    ace = class_adaptive_calibration_error(confidences, predictions, targets)
     
     return ece, ace
 
+
 def get_calibration_results(base_model, calibration_model, data_loader, device):
-    """Get detailed results for visualization"""
+    """
+    Get detailed calibration results for analysis and visualization.
+    
+    Args:
+        base_model: Base classification model
+        calibration_model: Calibration model
+        data_loader: DataLoader for evaluation
+        device: Device to use for evaluation
+        
+    Returns:
+        Dictionary containing confidences, predictions, and true labels
+    """
     base_model.eval()
     calibration_model.eval()
     
     all_confidences = []
     all_predictions = []
-    all_labels = []
-    all_logits = []
-    all_calibrated_logits = []
+    all_targets = []
+    all_probs = []  # Store all probability distributions
     
     with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, targets in data_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             
             # Get logits from base model
             logits = base_model(inputs)
             
             # Apply calibration
             calibrated_logits = calibration_model(logits)
-            probas = torch.softmax(calibrated_logits, dim=1)
             
-            # Get confidence and predictions
-            confidences, predictions = torch.max(probas, dim=1)
+            # Get softmax probabilities
+            probs = torch.softmax(calibrated_logits, dim=1)
             
-            all_confidences.extend(confidences.cpu().numpy())
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_logits.append(logits.cpu().numpy())
-            all_calibrated_logits.append(calibrated_logits.cpu().numpy())
+            # Get predictions and confidences
+            confidences, predictions = torch.max(probs, dim=1)
+            
+            # Store results
+            all_confidences.append(confidences.cpu().numpy())
+            all_predictions.append(predictions.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
     
-    return {
-        'confidences': np.array(all_confidences),
-        'predictions': np.array(all_predictions),
-        'labels': np.array(all_labels),
-        'logits': np.concatenate(all_logits) if all_logits else np.array([]),
-        'calibrated_logits': np.concatenate(all_calibrated_logits) if all_calibrated_logits else np.array([])
+    # Concatenate results
+    results = {
+        'confidences': np.concatenate(all_confidences),
+        'predictions': np.concatenate(all_predictions),
+        'labels': np.concatenate(all_targets),
+        'probabilities': np.concatenate(all_probs)
     }
+    
+    return results
