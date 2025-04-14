@@ -5,8 +5,21 @@ import numpy as np
 from .metrics import expected_calibration_error, class_adaptive_calibration_error
 
 def train_calibration(base_model, calibration_model, train_loader, val_loader, lr=0.01, epochs=50, 
-                     l2_reg_strength=0.01, device=None):
-    """Train the calibration model"""
+                     l2_reg_strength=0.01, device=None, patience=5):
+    """
+    Train the calibration model with early stopping
+    
+    Args:
+        base_model: The pre-trained classification model
+        calibration_model: The calibration model to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        lr: Learning rate
+        epochs: Maximum number of epochs
+        l2_reg_strength: L2 regularization strength
+        device: Device to use for training
+        patience: Number of epochs to wait for improvement before early stopping
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -20,11 +33,22 @@ def train_calibration(base_model, calibration_model, train_loader, val_loader, l
     
     # Use NLL loss for calibration
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(calibration_model.parameters(), lr=lr)
+    
+    # Adjust learning rate and regularization based on model type
+    if isinstance(calibration_model, nn.Module) and hasattr(calibration_model, 'temperatures'):
+        # For class-adaptive model, use stronger regularization and lower learning rate
+        l2_reg_strength = max(l2_reg_strength * 5, 0.05)  # Increase regularization for class-adaptive
+        optimizer = optim.Adam(calibration_model.parameters(), lr=lr/2)  # Lower learning rate
+        print(f"Class-Adaptive model: using L2 reg={l2_reg_strength}, lr={lr/2}")
+    else:
+        optimizer = optim.Adam(calibration_model.parameters(), lr=lr)
+        print(f"Standard model: using L2 reg={l2_reg_strength}, lr={lr}")
     
     # Keep track of best model
     best_ace = float('inf')
+    best_ece = float('inf')
     best_model_state = None
+    no_improve_count = 0
     
     # Training loop
     for epoch in range(epochs):
@@ -46,34 +70,65 @@ def train_calibration(base_model, calibration_model, train_loader, val_loader, l
             
             # Apply L2 regularization on temperature parameters
             if hasattr(calibration_model, 'temperatures'):
-                l2_reg = l2_reg_strength * torch.norm(calibration_model.temperatures)
+                # Use stronger regularization for class-adaptive
+                # Encourage temperatures to stay close to 1 (well-calibrated)
+                temps = calibration_model.temperatures
+                l2_reg = l2_reg_strength * torch.sum((temps - 1.0)**2)
                 loss += l2_reg
             elif hasattr(calibration_model, 'temperature'):
-                l2_reg = l2_reg_strength * torch.norm(calibration_model.temperature)
+                l2_reg = l2_reg_strength * torch.sum((calibration_model.temperature - 1.0)**2)
                 loss += l2_reg
             
             # Update parameters
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent extreme values
+            torch.nn.utils.clip_grad_norm_(calibration_model.parameters(), max_norm=1.0)
+            
             optimizer.step()
+            
+            # Add temperature constraints - prevent temperatures from getting too extreme
+            if hasattr(calibration_model, 'temperatures'):
+                with torch.no_grad():
+                    calibration_model.temperatures.data.clamp_(min=0.5, max=3.0)
+            elif hasattr(calibration_model, 'temperature'):
+                with torch.no_grad():
+                    calibration_model.temperature.data.clamp_(min=0.5, max=3.0)
             
             running_loss += loss.item()
         
         avg_loss = running_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
         
-        # Validation
-        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-            ece, ace = evaluate_calibration(base_model, calibration_model, val_loader, device)
-            print(f"Validation - ECE: {ece:.4f}, ACE: {ace:.4f}")
-            
-            if ace < best_ace:
-                best_ace = ace
-                best_model_state = calibration_model.state_dict().copy()
+        # Validation after each epoch
+        ece, ace = evaluate_calibration(base_model, calibration_model, val_loader, device)
+        print(f"Validation - ECE: {ece:.4f}, ACE: {ace:.4f}")
+        
+        # Save best model based on ECE as primary metric
+        if ece < best_ece:
+            best_ece = ece
+            best_ace = ace
+            best_model_state = calibration_model.state_dict().copy()
+            no_improve_count = 0
+            print(f"New best model! ECE: {ece:.4f}, ACE: {ace:.4f}")
+        else:
+            no_improve_count += 1
+        
+        # Early stopping
+        if no_improve_count >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+    
+    # Print temperature statistics if available
+    if hasattr(calibration_model, 'temperatures'):
+        temps = calibration_model.temperatures.detach().cpu().numpy()
+        print(f"Temperature stats - Min: {temps.min():.4f}, Max: {temps.max():.4f}, Mean: {temps.mean():.4f}")
     
     # Load best model
     if best_model_state is not None:
         calibration_model.load_state_dict(best_model_state)
+        print(f"Loaded best model with ECE: {best_ece:.4f}, ACE: {best_ace:.4f}")
     
     return calibration_model
 

@@ -15,6 +15,10 @@ def main(args):
     os.makedirs('models', exist_ok=True)
     os.makedirs('results', exist_ok=True)
     
+    # Set seed for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
@@ -45,12 +49,14 @@ def main(args):
         print("Training base model...")
         # Add base model training code here if needed
     
-    # Initialize calibration models
+    # Initialize calibration models - using different settings for each
     print("Initializing calibration models...")
     standard_calibration = StandardTemperatureScaling(init_temp=1.5)
-    adaptive_calibration = ClassAdaptiveCalibration(num_classes=100, init_temp=1.5)
     
-    # Train standard calibration
+    # For class-adaptive, initialize temperatures closer to 1
+    adaptive_calibration = ClassAdaptiveCalibration(num_classes=100, init_temp=1.0)
+    
+    # Train standard calibration first
     print("\nTraining standard temperature scaling...")
     standard_calibration = train_calibration(
         base_model, 
@@ -60,13 +66,14 @@ def main(args):
         lr=args.learning_rate,
         epochs=args.epochs,
         l2_reg_strength=args.l2_reg,
-        device=device
+        device=device,
+        patience=args.patience
     )
     
     # Save model
     torch.save(standard_calibration.state_dict(), os.path.join('models', 'standard_calibration.pth'))
     
-    # Train adaptive calibration
+    # Train adaptive calibration with stronger regularization
     print("\nTraining class-adaptive calibration...")
     adaptive_calibration = train_calibration(
         base_model, 
@@ -74,9 +81,10 @@ def main(args):
         train_loader, 
         val_loader, 
         lr=args.learning_rate,
-        epochs=args.epochs,
-        l2_reg_strength=args.l2_reg,
-        device=device
+        epochs=args.epochs * 2,  # Double the epochs for class-adaptive
+        l2_reg_strength=args.l2_reg * 5,  # Stronger regularization
+        device=device,
+        patience=args.patience * 2
     )
     
     # Save model
@@ -140,7 +148,7 @@ def main(args):
     )
     
     # ECE per class
-    plot_ece_per_class(
+    std_ece_per_class = plot_ece_per_class(
         standard_results['confidences'],
         standard_results['predictions'],
         standard_results['labels'],
@@ -148,13 +156,37 @@ def main(args):
         save_path=os.path.join('results', f'ece_per_class_standard_{timestamp}.png')
     )
     
-    plot_ece_per_class(
+    adp_ece_per_class = plot_ece_per_class(
         adaptive_results['confidences'],
         adaptive_results['predictions'],
         adaptive_results['labels'],
         adaptive_results['labels'],  # Using labels as class indices
         save_path=os.path.join('results', f'ece_per_class_adaptive_{timestamp}.png')
     )
+    
+    # Plot ECE improvement per class
+    if std_ece_per_class and adp_ece_per_class:
+        import matplotlib.pyplot as plt
+        
+        ece_improvement = np.array(std_ece_per_class) - np.array(adp_ece_per_class)
+        
+        plt.figure(figsize=(12, 6))
+        plt.bar(range(len(ece_improvement)), ece_improvement)
+        plt.xlabel('Class Index')
+        plt.ylabel('ECE Improvement')
+        plt.title('ECE Improvement per Class (Standard vs Adaptive)')
+        plt.axhline(y=0, color='r', linestyle='-')  # Add line at y=0
+        plt.tight_layout()
+        plt.savefig(os.path.join('results', f'ece_improvement_{timestamp}.png'))
+        plt.close()
+        
+        # Calculate and report overall statistics
+        improvement_percent = len(ece_improvement[ece_improvement > 0]) / len(ece_improvement) * 100
+        print(f"\nClass-wise improvement statistics:")
+        print(f"  - Classes improved: {len(ece_improvement[ece_improvement > 0])}/{len(ece_improvement)} ({improvement_percent:.1f}%)")
+        print(f"  - Average improvement: {np.mean(ece_improvement):.4f}")
+        print(f"  - Maximum improvement: {np.max(ece_improvement):.4f}")
+        print(f"  - Minimum improvement: {np.min(ece_improvement):.4f}")
     
     print(f"\nExperiment completed. Results saved to {result_file}")
 
@@ -166,6 +198,8 @@ if __name__ == "__main__":
     parser.add_argument('--l2_reg', type=float, default=0.01, help='L2 regularization strength')
     parser.add_argument('--train_base', action='store_true', help='Train the base model from scratch')
     parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA training')
+    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     
     args = parser.parse_args()
     main(args)
